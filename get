@@ -2,9 +2,9 @@
 cd "$(dirname "$0")"
 . common/libc.sh
 
-# get_current_ubuntu trusty i386 libc6
-# get_current_ubuntu trusty amd64 libc6
-# get_current_ubuntu trusty amd64 libc6-i386
+#get_current_ubuntu trusty i386 libc6
+#get_current_ubuntu trusty amd64 libc6
+#get_current_ubuntu trusty amd64 libc6-i386
 #get_current_ubuntu utopic i386 libc6
 #get_current_ubuntu utopic amd64 libc6
 #get_current_ubuntu utopic amd64 libc6-i386
