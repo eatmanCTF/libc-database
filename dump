@@ -7,7 +7,7 @@ fi
 id=$1
 shift 1
 if [[ $# == 0 ]]; then
-  names="__libc_start_main_ret system dup2 read write str_bin_sh"
+  names="__libc_start_main_ret system execve dup2 open read write gets str_bin_sh __malloc_hook __free_hook __realloc_hook __after_morecore_hook stdin stdout _IO_list_all"
 else
   names="$@"
 fi
