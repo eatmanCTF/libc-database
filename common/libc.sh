@@ -1,6 +1,6 @@
 #!/bin/bash
 
-mkdir -p db
+mkdir -p db/.debug
 
 die() {
   echo >&2 $1
