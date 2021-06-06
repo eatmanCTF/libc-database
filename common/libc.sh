@@ -1,6 +1,6 @@
 #!/bin/bash
 
-mkdir -p db/.debug
+mkdir -p db
 
 die() {
   echo >&2 $1
@@ -8,7 +8,7 @@ die() {
 }
 
 dump_symbols() {
-  readelf -Ws $1 | perl -n -e '/: (\w*).*?(\w+)@@GLIBC_/ && print "$2 $1\n"'
+  readelf -Ws $1 | perl -n -e '/: (\w+)\s+\w+\s+(?:FUNC|OBJECT)\s+(?:\w+\s+){3}(\w+)\b(?:@@GLIBC)?/ && print "$2 $1\n"' | sort -u
 }
 
 extract_label() {
@@ -17,12 +17,12 @@ extract_label() {
 
 dump_libc_start_main_ret() {
   local call_main=`objdump -D $1 \
-    | egrep -A 100 '<__libc_start_main.*>' \
+    | grep -EA 100 '<__libc_start_main.*>' \
     | grep call \
-    | egrep -B 1 '<exit.*>' \
+    | grep -EB 1 '<exit.*>' \
     | head -n 1 \
     | extract_label`
-  local offset=`objdump -D $1 | egrep -A 1 "(^| )$call_main:" | tail -n 1 | extract_label`
+  local offset=`objdump -D $1 | grep -EA 1 "(^| )$call_main:" | tail -n 1 | extract_label`
   if [[ "$offset" != "" ]]; then
     echo "__libc_start_main_ret $offset"
   fi
@@ -40,7 +40,7 @@ process_libc() {
   local id=$2
   local info=$3
   local url=$4
-  echo "  -> Writing ${libc} to db/${id}.so"
+  echo "  -> Writing libc ${libc} to db/${id}.so"
   cp $libc db/${id}.so
   echo "  -> Writing symbols to db/${id}.symbols"
   (dump_symbols $libc; dump_libc_start_main_ret $libc; dump_bin_sh $libc) \
@@ -57,129 +57,381 @@ process_ld() {
   cp $ld db/${id}.so
 }
 
-process_libc_dbg() {
-  local libc=$1
-  local id=$2
-  if [ ! -d db/.debug/${id} ];then
-    mkdir -p db/.debug/${id}
-  fi
-  echo "  -> Writing ${libc} to db/.debug/${id}/"
-  cp $libc db/.debug/${id}/
-}
-process_ld_dbg() {
-  local ld=$1
-  local id=$2
-  if [ ! -d db/.debug/${id} ];then
-    mkdir -p db/.debug/${id}
-  fi
-  echo "  -> Writing ${ld} to db/.debug/${id}/"
-  cp $ld db/.debug/${id}/
+index_libc() {
+  local tmp="$1"
+  local id="$2"
+  local id_ld="ld_$2"
+  local info="$3"
+  local url="$4"
+  suffix=
+  cnt=1
+  # Sometimes, the real libc.so is not matched with `libc.so*`.
+  libs=$(find "$tmp" -name 'libc.so*';find "$tmp" -name 'libc[-_.][a-z]*.so*')
+  [[ -z "$libs" ]] && die "Cannot locate the libc file"
+  for libc in $libs; do
+    # Some file matched can be ASCII files instead :(
+    if ! (file "$libc" | grep -q 'ELF\|symbolic link to') ; then
+      echo "  -> libc ${libc} is not an ELF file"
+      continue  # Keep cnt and suffix as it
+    fi
+    process_libc "$libc" "$id$suffix" "$info" "$url"
+    cnt=$((cnt+1))
+    suffix=_$cnt
+  done
+
+  libs_ld=$(find $tmp -name "ld-*so")
+  [[ -z "$libs_ld" ]] && die "Cannot locate the ld file"
+  for ld in $libs_ld; do
+    # Some file matched can be ASCII files instead :(
+    if ! (file "$ld" | grep -q 'ELF\|symbolic link to') ; then
+      echo "  -> ld ${ld} is not an ELF file"
+      continue  # Keep cnt and suffix as it
+    fi
+    process_ld "$ld" "$id_ld"
+  done
 }
 
 check_id() {
   local id=$1
   if [[ -e db/${id}.info ]]; then
-    echo "  -> Already have this version, 'rm db/${id}.*' to force"
+    echo "  -> Already have this version, 'rm ${PWD}/db/${id}.*' to force"
     return 1
   fi
   return 0
 }
 
-# ===== Ubuntu ===== #
+requirements_general() {
+  which readelf 1>/dev/null 2>&1 || return
+  which perl    1>/dev/null 2>&1 || return
+  which objdump 1>/dev/null 2>&1 || return
+  which strings 1>/dev/null 2>&1 || return
+  which find    1>/dev/null 2>&1 || return
+  which grep    1>/dev/null 2>&1 || return
+  return 0
+}
 
-get_ubuntu() {
+# ===== Debian-like ===== #
+
+get_debian() {
   local url="$1"
   local info="$2"
-  local urldbg="$3"
-  # echo "url: $url"
-  # echo "info: $info"
-  # echo "urldbg: $urldbg"
-
+  local pkgname="$3"
   local tmp=`mktemp -d`
-  echo "Getting libc:$info"
+  echo "Getting $info"
   echo "  -> Location: $url"
-  local id=`echo $url | perl -n -e '/(libc6[^\/]*)\./ && print $1' | sed "s/^libc6//"`
-  local libc_id="libc6${id}"
-  local ld_id="ld${id}"
-  # local ld_id=`echo $id | sed "s/libc6/ld/"`
-  echo "  -> LIBC_ID: $libc_id"
-  echo "  -> LD_ID: $ld_id"
-  check_id $libc_id || return
-  echo "  -> Downloading libc package"
-  wget "$url" -O $tmp/pkg.deb || die "Failed to download package from $url"
-  echo "  -> Extracting libc package"
+  local id=`echo $url | perl -n -e '/('"$pkgname"'[^\/]*)\./ && print $1'`
+  echo "  -> ID: $id"
+  check_id $id || return
+  echo "  -> Downloading package"
+  if ! wget "$url" 2>/dev/null -O $tmp/pkg.deb; then
+    echo >&2 "Failed to download package from $url"
+    return
+  fi
+  echo "  -> Extracting package"
   pushd $tmp 1>/dev/null
   ar x pkg.deb || die "ar failed"
   tar xf data.tar.* || die "tar failed"
   popd 1>/dev/null
-  suffix=
-  cnt=1
-  for libc in $(find $tmp -name "libc-*so" || die "Cannot locate libc.so.6"); do
-    process_libc $libc $libc_id$suffix $info $url
-    cnt=$((cnt+1))
-    suffix=_$cnt
-  done
-  for ld in $(find $tmp -name "ld-*so" || die "Cannot locate ld-linux.so"); do
-    process_ld $ld $ld_id
-  done
+  index_libc "$tmp" "$id" "$info" "$url"
   rm -rf $tmp
-  
-  if [ -n "$urldbg" ];then
-    local tmpdbg=`mktemp -d`
-    echo "  -> Location: $urldbg"
-    echo "  -> LIBC_ID: $libc_id"
-    echo "  -> LD_ID: $ld_id"
-    echo "  -> Downloading libc-dbg package"
-    wget "$urldbg" -O $tmpdbg/pkg.deb  || die "Failed to download package from $urldbg"
-    echo "  -> Extracting libc-dbg package"
-    pushd $tmpdbg 1>/dev/null
-    ar x pkg.deb || die "ar failed"
-    tar xf data.tar.* || die "tar failed"
-    popd 1>/dev/null
-    for libc in $(find $tmpdbg -name "libc-*so" || die "Cannot locate libc.so.6"); do
-      process_libc_dbg $libc $libc_id
-    done
-    for ld in $(find $tmpdbg -name "ld-*so" || die "Cannot locate ld-linux.so"); do
-      process_ld_dbg $ld $libc_id
-    done
-  fi
-  rm -rf $tmpdbg
 }
 
-get_current_ubuntu() {
-  local version=$1
-  local arch=$2
-  local pkg=$3
-  local pkgdbg="$3"-dbg
-  local info=ubuntu-$version-$arch-$pkg
-  echo "Getting libc6 package location for ubuntu-$version-$arch"
-  echo "http://packages.ubuntu.com/$version/$arch/$pkg/download"
-  local url=`(wget http://packages.ubuntu.com/$version/$arch/$pkg/download -O - 2>/dev/null \
-               | grep -oh 'http://[^"]*libc6[^"]*.deb') | head -1 || die "Failed to get package version"`
-  echo "http://packages.ubuntu.com/$version/$arch/$pkgdbg/download"
-  echo "Getting libc6-dbg package location for ubuntu-$version-$arch"
-  local urldbg=`(wget http://packages.ubuntu.com/$version/$arch/$pkgdbg/download -O - 2>/dev/null \
-               | grep -oh 'http://[^"]*libc6[^"]*.deb') | head -1 || local urldbg=""`
-
-  get_ubuntu $url $info $urldbg
-}
-
-get_all_ubuntu() {
+get_all_debian() {
   local info=$1
   local url=$2
-  for f in `wget $url/ -O - 2>/dev/null | egrep -oh 'libc6(-i386|-amd64)?_[^"]*(amd64|i386)\.deb' |grep -v "</a>"`; do
-    get_ubuntu $url/$f $1 ""
+  local pkgname=$3
+  for f in `wget $url/ -O - 2>/dev/null | grep -Eoh "$pkgname"'(-i386|-amd64|-x32)?_[^"]*(amd64|i386)\.deb' |grep -v "</a>"`; do
+    get_debian "$url/$f" "$info" "$pkgname"
   done
+  return 0
+}
+
+requirements_debian() {
+  which mktemp 1>/dev/null 2>&1 || return
+  which perl   1>/dev/null 2>&1 || return
+  which wget   1>/dev/null 2>&1 || return
+  which ar     1>/dev/null 2>&1 || return
+  which tar    1>/dev/null 2>&1 || return
+  which grep   1>/dev/null 2>&1 || return
+  return 0
+}
+
+# ===== RPM ===== #
+
+get_rpm() {
+  local url="$1"
+  local info="$2"
+  local pkgname="$3"
+  local tmp="$(mktemp -d)"
+  echo "Getting $info"
+  echo "  -> Location: $url"
+  local id=$(echo "$url" | perl -n -e '/('"$pkgname"'[^\/]*)\./ && print $1')
+  echo "  -> ID: $id"
+  check_id "$id" || return
+  echo "  -> Downloading package"
+  if ! wget "$url" 2>/dev/null -O "$tmp/pkg.rpm"; then
+    echo >&2 "Failed to download package from $url"
+    return
+  fi
+  echo "  -> Extracting package"
+  pushd "$tmp" 1>/dev/null
+  (rpm2cpio pkg.rpm || die "rpm2cpio failed") | \
+    (cpio -id --quiet || die "cpio failed")
+  popd 1>/dev/null
+  index_libc "$tmp" "$id" "$info" "$url"
+  rm -rf "$tmp"
+}
+
+get_all_rpm() {
+  local info=$1
+  local pkg=$2
+  local pkgname=$3
+  local arch=$4
+  local website="http://rpmfind.net"
+  local searchurl="$website/linux/rpm2html/search.php?query=$pkg"
+  echo "Getting RPM package location: $info $pkg $pkgname $arch"
+  local url=""
+  for i in $(seq 1 3); do
+    urls=$(wget "$searchurl" -O - 2>/dev/null \
+      | grep -oh "/[^']*${pkgname}[^']*\.$arch\.rpm")
+    [[ -z "$urls" ]] || break
+    echo "Retrying..."
+    sleep 1
+  done
+
+  if ! [[ -n "$urls" ]]; then
+    echo >&2 "Failed to get RPM package URL for $info $pkg $pkgname $arch"
+    return
+  fi
+
+  for url in $urls
+  do
+    get_rpm "$website$url" "$info" "$pkgname"
+    sleep .1
+  done
+}
+
+requirements_rpm() {
+  which mktemp   1>/dev/null 2>&1 || return
+  which perl     1>/dev/null 2>&1 || return
+  which wget     1>/dev/null 2>&1 || return
+  which rpm2cpio || return
+  which cpio     1>/dev/null 2>&1 || return
+  which grep     1>/dev/null 2>&1 || return
+  return 0
+}
+
+# ===== CentOS ===== #
+
+get_from_filelistgz() {
+  local info=$1
+  local website=$2
+  local pkg=$3
+  local arch=$4
+  echo "Getting package $pkg locations"
+  local url=""
+  for i in $(seq 1 3); do
+    urls=$(wget "$website/filelist.gz" -O - 2>/dev/null \
+      | gzip -cd \
+      | grep -h "$pkg-[0-9]" \
+      | grep -h "$arch\.rpm")
+    [[ -z "$urls" ]] || break
+    echo "Retrying..."
+    sleep 1
+  done
+  [[ -n "$urls" ]] || die "Failed to get package version"
+  for url in $urls
+  do
+    get_rpm "$website/$url" "$info" "$pkg"
+    sleep .1
+  done
+}
+
+requirements_centos() {
+  which wget       1>/dev/null 2>&1 || return
+  which gzip       1>/dev/null 2>&1 || return
+  which grep       1>/dev/null 2>&1 || return
+  requirements_rpm || return
+  return 0
+}
+
+
+# ===== Arch ===== #
+
+get_pkg() {
+  local url="$1"
+  local info="$2"
+  local pkgname="$3"
+  local tmp="$(mktemp -d)"
+  echo "Getting $info"
+  echo "  -> Location: $url"
+  local id=$(echo "$url" | perl -n -e '/('"$pkgname"'[^\/]*)\.pkg\.tar\.(xz|zst)/ && print $1' | ( (echo "$url" | grep -q 'lib32') && sed 's/x86_64/x86/g' || cat))
+  echo "  -> ID: $id"
+  check_id $id || return
+  echo "  -> Downloading package"
+  if ! wget "$url" 2>/dev/null -O "$tmp/pkg"; then
+    echo >&2 "Failed to download package from $url"
+    return
+  fi
+  echo "  -> Extracting package"
+  pushd "$tmp" 1>/dev/null
+  if (echo "$url" | grep -q '\.zst')
+  then
+    mv pkg pkg.tar.zst
+    zstd -dq pkg.tar.zst
+    tar xf pkg.tar --warning=none
+  fi
+  if (echo "$url" | grep -q '\.xz')
+  then
+    mv pkg pkg.tar.xz
+    tar xJf pkg.tar.xz --warning=none
+  fi
+  popd 1>/dev/null
+  index_libc "$tmp" "$id" "$info" "$url"
+  rm -rf "$tmp"
+}
+
+get_all_pkg() {
+  local info=$1
+  local directory=$2
+  local pkgname=$3
+  echo "Getting package $info locations"
+  local url=""
+  for i in $(seq 1 3); do
+    urls=$(wget "$directory" -O - 2>/dev/null \
+      | grep -oh '[^"]*'"$pkgname"'[^"]*\.pkg[^"]*' \
+      | grep -v '.sig' \
+      | grep -v '>')
+    [[ -z "$urls" ]] || break
+    echo "Retrying..."
+    sleep 1
+  done
+  [[ -n "$urls" ]] || die "Failed to get package version"
+  for url in $urls
+  do
+    get_pkg "$directory/$url" "$info" "$pkgname"
+    sleep .1
+  done
+}
+
+requirements_pkg() {
+  which mktemp 1>/dev/null 2>&1 || return
+  which perl   1>/dev/null 2>&1 || return
+  which grep   1>/dev/null 2>&1 || return
+  which sed    1>/dev/null 2>&1 || return
+  which cat    1>/dev/null 2>&1 || return
+  which wget   1>/dev/null 2>&1 || return
+  which zstd   1>/dev/null 2>&1 || return
+  which tar    1>/dev/null 2>&1 || return
+  which xz     1>/dev/null 2>&1 || return
+  return 0
+}
+
+
+# ===== Alpine ===== #
+
+get_apk() {
+  local url="$1"
+  local info="$2"229
+  local pkgname="$3"
+  local tmp=$(mktemp -d)
+  echo "Getting $info"
+  echo "  -> Location: $url"
+  local id=$(echo "$url" | perl -n -e '/('"$pkgname"'[^\/]*)\.apk/ && print $1')
+  echo "  -> ID: $id"
+  check_id $id || return
+  echo "  -> Downloading package"
+  if ! wget "$url" 2>/dev/null -O "$tmp/pkg.tar.gz"; then
+    echo >&2 "Failed to download package from $url"
+    return
+  fi
+  echo "  -> Extracting package"
+  pushd $tmp 1>/dev/null
+  tar xzf pkg.tar.gz --warning=none
+  popd 1>/dev/null
+  index_libc "$tmp" "$id" "$info" "$url"
+  rm -rf $tmp
+}
+
+get_all_apk() {
+  local info=$1
+  local repo=$2
+  local version=$3
+  local component=$4
+  local arch=$5
+  local pkgname=$6
+  local directory="$repo/$version/$component/$arch/"
+  echo "Getting package $info locations"
+  local url=""
+  for i in $(seq 1 3); do
+    urls=$(wget "$directory" -O - 2>/dev/null \
+      | grep -oh '[^"]*'"$pkgname"'-[0-9][^"]*\.apk' \
+      | grep -v '.sig' \
+      | grep -v '>')
+    [[ -z "$urls" ]] || break
+    echo "Retrying..."
+    sleep 1
+  done
+  [[ -n "$urls" ]] || die "Failed to get package version"
+  for url in $urls
+  do
+    get_apk "$directory$url" "$info" "$pkgname"
+    sleep .1
+  done
+}
+
+requirements_apk() {
+  which mktemp 1>/dev/null 2>&1 || return
+  which perl   1>/dev/null 2>&1 || return
+  which wget   1>/dev/null 2>&1 || return
+  which tar    1>/dev/null 2>&1 || return
+  which gzip    1>/dev/null 2>&1 || return
+  which grep   1>/dev/null 2>&1 || return
+  return 0
+}
+
+# ===== Launchpad =====
+
+get_all_launchpad() {
+  local info="$1"
+  local distro="$2"
+  local pkgname="$3"
+  local arch="$4"
+
+  local series=""
+  for series in $(wget "https://api.launchpad.net/1.0/$distro/series" -O - 2>/dev/null | jq '.entries[] | .name'); do
+    series=$(echo $series | grep -Eo '[^"]+')
+    echo "Launchpad: Series $series"
+    local apiurl="https://api.launchpad.net/1.0/$distro/+archive/primary?ws.op=getPublishedBinaries&binary_name=$pkgname&exact_match=true&distro_arch_series=https://api.launchpad.net/1.0/$distro/$series/$arch"
+    local url=""
+    urls=$(wget "$apiurl" -O - 2>/dev/null | jq '[ .entries[] | .build_link + "/+files/" + .binary_package_name + "_" + .source_package_version + "_" + (.distro_arch_series_link | split("/") | .[-1]) + ".deb" | ltrimstr("https://api.launchpad.net/1.0/") | "https://launchpad.net/" + . ] | unique | .[]')
+    for url in $urls; do
+      url=$(echo $url | grep -Eo '[^"]+')
+      # some old packages are deleted. ignore those.
+      get_debian "$url" "$info-$series" "$pkgname"
+    done
+  done
+}
+
+requirements_launchpad() {
+  which jq       1>/dev/null 2>&1 || return
+  requirements_debian || return
+  return 0
 }
 
 # ===== Local ===== #
 
 add_local() {
   local libc=$1
-  [[ -e $libc ]] || return
+  [[ -f $libc ]] || return
   local info="local"
   local id="local-`sha1sum $libc`"
   echo "Adding local libc $libc (id $id)"
   check_id $id || return
   process_libc $libc $id $info
+}
+
+requirements_local() {
+  which sha1sum 1>/dev/null 2>&1 || return
+  return 0
 }
