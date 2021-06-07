@@ -79,16 +79,17 @@ index_libc() {
     suffix=_$cnt
   done
 
-  libs_ld=$(find $tmp -name "ld-*so")
-  [[ -z "$libs_ld" ]] && die "Cannot locate the ld file"
-  for ld in $libs_ld; do
-    # Some file matched can be ASCII files instead :(
-    if ! (file "$ld" | grep -q 'ELF\|symbolic link to') ; then
-      echo "  -> ld ${ld} is not an ELF file"
-      continue  # Keep cnt and suffix as it
-    fi
-    process_ld "$ld" "$id_ld"
-  done
+  libs_ld=$(find $tmp -name "ld-*so*")
+  if [[ -z "$libs_ld" ]] ; then
+    for ld in $libs_ld; do
+      # Some file matched can be ASCII files instead :(
+      # if ! (file "$ld" | grep -q 'ELF\|symbolic link to') ; then
+      #   echo "  -> ld ${ld} is not an ELF file"
+      #   continue  # Keep cnt and suffix as it
+      # fi
+      process_ld "$ld" "$id_ld"
+    done
+  fi
 }
 
 check_id() {
